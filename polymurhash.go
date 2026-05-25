@@ -1,8 +1,10 @@
 package polymurhash
 
 import (
+	"crypto/rand"
 	"encoding/binary"
 	"math/bits"
+	"unsafe"
 )
 
 type uint128 struct {
@@ -62,11 +64,32 @@ func leUint64(b []byte) uint64 {
 	return uint64(lo) | (uint64(hi) << (8 * (l - 4)))
 }
 
-type Param struct {
+// Seed identifies a PolymurHash function. Seeds are immutable after
+// construction and may be reused concurrently
+//
+// The zero value is invalid. Create a Seed using MakeSeed, NewSeed, or NewSeedFromUint64
+type Seed struct {
 	k, k2, k7, s uint64
 }
 
-func New(kSeed, sSeed uint64) Param {
+// MakeSeed returns a Seed initialized from 128 bits of cryptographically
+// secure random material
+//
+// MakeSeed panics if the operating system random-number generator fails
+func MakeSeed() Seed {
+	var material [16]byte
+	if _, err := rand.Read(material[:]); err != nil {
+		panic("polymurhash: cannot generate random seed: " + err.Error())
+	}
+	return NewSeed(
+		binary.LittleEndian.Uint64(material[:8]),
+		binary.LittleEndian.Uint64(material[8:]),
+	)
+}
+
+// NewSeed returns a Seed deterministically expanded from two 64-bit seed
+// values. Callers should use independent random values for keyed hashing
+func NewSeed(kSeed, sSeed uint64) Seed {
 	s := sSeed ^ arbitrary1
 	var pow37 [64]uint64
 	pow37[0] = 37
@@ -106,7 +129,7 @@ func New(kSeed, sSeed uint64) Param {
 		k4 := red611(mul128(k2, k2))
 		k7 := extrared611(red611(mul128(k3, k4)))
 		if k7 < (1<<60)-(1<<56) {
-			return Param{
+			return Seed{
 				k:  k,
 				k2: k2,
 				k7: k7,
@@ -116,22 +139,29 @@ func New(kSeed, sSeed uint64) Param {
 	}
 }
 
-func From(seed uint64) Param {
-	return New(mix(seed+arbitrary3), mix(seed+arbitrary4))
+// NewSeedFromUint64 returns a Seed deterministically expanded from one 64-bit
+// seed value. Use NewSeed or MakeSeed when 128 bits of seed material are required
+func NewSeedFromUint64(seed uint64) Seed {
+	return NewSeed(mix(seed+arbitrary3), mix(seed+arbitrary4))
 }
 
-func (p Param) HashPoly611(b []byte, tweak uint64) uint64 {
+func (seed Seed) valid() bool {
+	// Initialization always derives a nonzero generator for k
+	return seed.k != 0
+}
+
+func hashPoly611(seed Seed, b []byte, tweak uint64) uint64 {
 	polyAcc := tweak
 	if len(b) <= 7 {
 		m0 := leUint64(b)
-		return polyAcc + red611(mul128(p.k+m0, p.k2+uint64(len(b))))
+		return polyAcc + red611(mul128(seed.k+m0, seed.k2+uint64(len(b))))
 	}
-	k3 := red611(mul128(p.k, p.k2))
-	k4 := red611(mul128(p.k2, p.k2))
+	k3 := red611(mul128(seed.k, seed.k2))
+	k4 := red611(mul128(seed.k2, seed.k2))
 
 	if len(b) >= 50 {
-		k5 := extrared611(red611(mul128(p.k, k4)))
-		k6 := extrared611(red611(mul128(p.k2, k4)))
+		k5 := extrared611(red611(mul128(seed.k, k4)))
+		k6 := extrared611(red611(mul128(seed.k2, k4)))
 		k3 = extrared611(k3)
 		k4 = extrared611(k4)
 		h := uint64(0)
@@ -140,10 +170,10 @@ func (p Param) HashPoly611(b []byte, tweak uint64) uint64 {
 			for i := range m {
 				m[i] = binary.LittleEndian.Uint64(b[7*i:]) & 0x00ffffffffffffff
 			}
-			t0 := mul128(p.k+m[0], k6+m[1])
-			t1 := mul128(p.k2+m[2], k5+m[3])
+			t0 := mul128(seed.k+m[0], k6+m[1])
+			t1 := mul128(seed.k2+m[2], k5+m[3])
 			t2 := mul128(k3+m[4], k4+m[5])
-			t3 := mul128(h+m[6], p.k7)
+			t3 := mul128(h+m[6], seed.k7)
 			s := add128(add128(t0, t1), add128(t2, t3))
 			h = red611(s)
 			b = b[49:]
@@ -151,7 +181,7 @@ func (p Param) HashPoly611(b []byte, tweak uint64) uint64 {
 				break
 			}
 		}
-		k14 := red611(mul128(p.k7, p.k7))
+		k14 := red611(mul128(seed.k7, seed.k7))
 		hk14 := red611(mul128(extrared611(h), k14))
 		polyAcc += extrared611(hk14)
 	}
@@ -159,8 +189,8 @@ func (p Param) HashPoly611(b []byte, tweak uint64) uint64 {
 		m0 := binary.LittleEndian.Uint64(b) & 0x00ffffffffffffff
 		m1 := binary.LittleEndian.Uint64(b[(len(b)-7)/2:]) & 0x00ffffffffffffff
 		m2 := binary.LittleEndian.Uint64(b[len(b)-8:]) >> 8
-		t0 := mul128(p.k2+m0, p.k7+m1)
-		t1 := mul128(p.k+m2, k3+uint64(len(b)))
+		t0 := mul128(seed.k2+m0, seed.k7+m1)
+		t1 := mul128(seed.k+m2, k3+uint64(len(b)))
 		if len(b) <= 21 {
 			return polyAcc + red611(add128(t0, t1))
 		}
@@ -169,16 +199,29 @@ func (p Param) HashPoly611(b []byte, tweak uint64) uint64 {
 		m5 := binary.LittleEndian.Uint64(b[len(b)-21:]) & 0x00ffffffffffffff
 		m6 := binary.LittleEndian.Uint64(b[len(b)-14:]) & 0x00ffffffffffffff
 		t0r := red611(t0)
-		t2 := mul128(p.k2+m3, p.k7+m4)
+		t2 := mul128(seed.k2+m3, seed.k7+m4)
 		t3 := mul128(t0r+m5, k4+m6)
 		s := add128(add128(t1, t2), t3)
 		return polyAcc + red611(s)
 	}
 	m0 := leUint64(b)
-	return polyAcc + red611(mul128(p.k+m0, p.k2+uint64(len(b))))
+	return polyAcc + red611(mul128(seed.k+m0, seed.k2+uint64(len(b))))
 }
 
-func (p Param) Hash(b []byte, tweak uint64) uint64 {
-	h := p.HashPoly611(b, tweak)
-	return mix(h) + p.s
+// Bytes returns the PolymurHash of b using seed and tweak
+//
+// It panics if seed is the zero value
+func Bytes(seed Seed, b []byte, tweak uint64) uint64 {
+	if !seed.valid() {
+		panic("polymurhash: use of uninitialized Seed")
+	}
+	return mix(hashPoly611(seed, b, tweak)) + seed.s
+}
+
+// String returns the PolymurHash of s using seed and tweak without allocating
+// a byte-slice copy of s
+//
+// It panics if seed is the zero value
+func String(seed Seed, s string, tweak uint64) uint64 {
+	return Bytes(seed, unsafe.Slice(unsafe.StringData(s), len(s)), tweak)
 }
