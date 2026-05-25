@@ -1,3 +1,3 @@
-module github.com/orisano/polymurhash
+module github.com/vmikk/polymurhash
 
 go 1.25
