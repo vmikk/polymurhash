@@ -1,11 +1,12 @@
 package polymurhash
 
 import (
+	"sync"
 	"testing"
 )
 
-func TestParam_Hash(t *testing.T) {
-	h := From(0xfedbca9876543210)
+func TestBytesReferenceVectors(t *testing.T) {
+	seed := NewSeedFromUint64(0xfedbca9876543210)
 	tweak := uint64(0xabcdef0123456789)
 
 	in := []string{
@@ -139,10 +140,203 @@ func TestParam_Hash(t *testing.T) {
 	}
 
 	for i := range in {
-		got := h.Hash([]byte(in[i]), tweak)
+		got := Bytes(seed, []byte(in[i]), tweak)
 		if got != expected[i] {
-			t.Log("b:", in[i])
-			t.Errorf("unexpected result(expected=%v, got=%v)", expected[i], got)
+			t.Errorf("Bytes(%q) = %#016x, want %#016x", in[i], got, expected[i])
 		}
 	}
+}
+
+func TestBytesReferenceBoundaryVectors(t *testing.T) {
+	seed := NewSeed(0x0123456789abcdef, 0xfedcba9876543210)
+	// Generated with the C reference implementation using boundaryInput's
+	// byte pattern and the constructor inputs above.
+	tests := []struct {
+		length int
+		tweak  uint64
+		want   uint64
+	}{
+		{0, 0x0000000000000000, 0x9cf06d3b69b56359},
+		{7, 0x0000000000000000, 0x846621a38a9e05fe},
+		{8, 0x0000000000000000, 0xbb3f02c9a7d280dc},
+		{21, 0x0000000000000000, 0xfc88bff4a2930ef1},
+		{22, 0x0000000000000000, 0xe1c8ffbc0028e4ad},
+		{49, 0x0000000000000000, 0xc075f85f2666f13f},
+		{50, 0x0000000000000000, 0x0e2eba97031ccd58},
+		{56, 0x0000000000000000, 0x9cef593586708618},
+		{57, 0x0000000000000000, 0xb427fbcdcb0c7c66},
+		{70, 0x0000000000000000, 0xd1d8cb8c53d8374b},
+		{71, 0x0000000000000000, 0x081ea7e86b71dd58},
+		{98, 0x0000000000000000, 0xb41a35541964a8eb},
+		{99, 0x0000000000000000, 0xaf525e7d6d4d22c1},
+		{0, 0x0123456789abcdef, 0x0d6aa308c4f2d3a2},
+		{7, 0x0123456789abcdef, 0x1e7183500d30fe0b},
+		{8, 0x0123456789abcdef, 0xef07968aa97cfb9b},
+		{21, 0x0123456789abcdef, 0xd88997592113da19},
+		{22, 0x0123456789abcdef, 0x432aaff8a43120f0},
+		{49, 0x0123456789abcdef, 0xfc0edc70278c81d6},
+		{50, 0x0123456789abcdef, 0xc4449708fe1b8da0},
+		{56, 0x0123456789abcdef, 0x345b5c781c4e29be},
+		{57, 0x0123456789abcdef, 0x7ab2366c18716045},
+		{70, 0x0123456789abcdef, 0xf3bc7b85b08d4fd0},
+		{71, 0x0123456789abcdef, 0x60e8a9b58f4fed8a},
+		{98, 0x0123456789abcdef, 0xfae6252079e72f1a},
+		{99, 0x0123456789abcdef, 0x0ec1223ae5945ad5},
+		{0, 0xffffffffffffffff, 0xa46b08d30749f68c},
+		{7, 0xffffffffffffffff, 0x1841904114d5d1ce},
+		{8, 0xffffffffffffffff, 0x1a1e80b7e3334239},
+		{21, 0xffffffffffffffff, 0x20c25d599e8a34cc},
+		{22, 0xffffffffffffffff, 0x6c8722e43e838040},
+		{49, 0xffffffffffffffff, 0x2b71efcb1c0aae38},
+		{50, 0xffffffffffffffff, 0x0bf97a3dea12e172},
+		{56, 0xffffffffffffffff, 0xc26bb2a957e36248},
+		{57, 0xffffffffffffffff, 0xb90c000d148a13f8},
+		{70, 0xffffffffffffffff, 0x278b41f17ebf06d1},
+		{71, 0xffffffffffffffff, 0x3817dfa07adac2d7},
+		{98, 0xffffffffffffffff, 0xb6b385ab9cc7fcdc},
+		{99, 0xffffffffffffffff, 0x56a7e1736df23223},
+	}
+
+	for _, test := range tests {
+		got := Bytes(seed, boundaryInput(test.length), test.tweak)
+		if got != test.want {
+			t.Errorf("Bytes(length=%d, tweak=%#016x) = %#016x, want %#016x", test.length, test.tweak, got, test.want)
+		}
+	}
+}
+
+func TestStringMatchesBytes(t *testing.T) {
+	seed := NewSeed(0x0123456789abcdef, 0xfedcba9876543210)
+	tests := [][]byte{
+		nil,
+		[]byte("polymurhash"),
+		{0, 1, 2, 0xff, 0, 0x80, 7},
+		boundaryInput(49),
+		boundaryInput(99),
+	}
+	for _, input := range tests {
+		for _, tweak := range []uint64{0, 1, 0xabcdef0123456789, ^uint64(0)} {
+			got := String(seed, string(input), tweak)
+			want := Bytes(seed, input, tweak)
+			if got != want {
+				t.Errorf("String and Bytes differ for %x, tweak=%#016x: got %#016x, want %#016x", input, tweak, got, want)
+			}
+		}
+	}
+}
+
+func TestSeedConstructors(t *testing.T) {
+	const (
+		kSeed = uint64(0x0123456789abcdef)
+		sSeed = uint64(0xfedcba9876543210)
+		one   = uint64(0x9e3779b97f4a7c15)
+	)
+	input := boundaryInput(57)
+	tweak := uint64(0xa5a5a5a5a5a5a5a5)
+
+	if got, want := NewSeed(kSeed, sSeed), NewSeed(kSeed, sSeed); got != want {
+		t.Fatal("NewSeed is not deterministic")
+	}
+	if got, want := NewSeedFromUint64(one), NewSeedFromUint64(one); got != want {
+		t.Fatal("NewSeedFromUint64 is not deterministic")
+	}
+
+	Bytes(MakeSeed(), input, tweak)
+}
+
+func TestZeroSeedPanics(t *testing.T) {
+	tests := map[string]func(){
+		"Bytes":  func() { Bytes(Seed{}, nil, 0) },
+		"String": func() { String(Seed{}, "", 0) },
+	}
+	for name, fn := range tests {
+		t.Run(name, func(t *testing.T) {
+			defer func() {
+				if recover() == nil {
+					t.Fatal("use of zero Seed did not panic")
+				}
+			}()
+			fn()
+		})
+	}
+}
+
+func TestConcurrentSeedReuse(t *testing.T) {
+	seed := NewSeed(0x0123456789abcdef, 0xfedcba9876543210)
+	input := boundaryInput(999)
+	tweaks := []uint64{0, 1, 0xabcdef0123456789, ^uint64(0)}
+	want := make([]uint64, len(tweaks))
+	for i, tweak := range tweaks {
+		want[i] = Bytes(seed, input, tweak)
+	}
+
+	type mismatch struct {
+		got  uint64
+		want uint64
+	}
+	const workers = 8
+	failures := make(chan mismatch, workers)
+	var wg sync.WaitGroup
+	for worker := 0; worker < workers; worker++ {
+		wg.Add(1)
+		go func(worker int) {
+			defer wg.Done()
+			for i := 0; i < 100; i++ {
+				index := (worker + i) % len(tweaks)
+				if got := Bytes(seed, input, tweaks[index]); got != want[index] {
+					failures <- mismatch{got: got, want: want[index]}
+					return
+				}
+			}
+		}(worker)
+	}
+	wg.Wait()
+	close(failures)
+	for failure := range failures {
+		t.Errorf("concurrent hash = %#016x, want %#016x", failure.got, failure.want)
+	}
+}
+
+var hashResult uint64
+
+func TestOneShotAllocs(t *testing.T) {
+	seed := NewSeed(0x0123456789abcdef, 0xfedcba9876543210)
+	input := boundaryInput(99)
+	text := string(input)
+	const tweak = uint64(0xabcdef0123456789)
+
+	tests := map[string]func(){
+		"Bytes":  func() { hashResult = Bytes(seed, input, tweak) },
+		"String": func() { hashResult = String(seed, text, tweak) },
+	}
+	for name, fn := range tests {
+		t.Run(name, func(t *testing.T) {
+			if got := testing.AllocsPerRun(1000, fn); got != 0 {
+				t.Fatalf("%s allocated %.2f objects per call", name, got)
+			}
+		})
+	}
+}
+
+func FuzzStringMatchesBytes(f *testing.F) {
+	seed := NewSeed(0x0123456789abcdef, 0xfedcba9876543210)
+	f.Add([]byte{}, uint64(0))
+	f.Add(boundaryInput(7), uint64(1))
+	f.Add(boundaryInput(50), uint64(0xabcdef0123456789))
+	f.Add(boundaryInput(99), ^uint64(0))
+	f.Fuzz(func(t *testing.T, input []byte, tweak uint64) {
+		got := String(seed, string(input), tweak)
+		want := Bytes(seed, input, tweak)
+		if got != want {
+			t.Fatalf("String and Bytes differ for %x, tweak=%#016x: got %#016x, want %#016x", input, tweak, got, want)
+		}
+	})
+}
+
+func boundaryInput(length int) []byte {
+	input := make([]byte, length)
+	for i := range input {
+		input[i] = byte(i*131 + 17)
+	}
+	return input
 }
